@@ -28,24 +28,34 @@ package queuedwriter
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 )
+
+var ErrTooLarge = errors.New("queuedWriter.W: too large")
 
 type W struct {
 	W       io.Writer
 	out     *bytes.Buffer
 	wg      sync.WaitGroup
 	lock    sync.Mutex
+	maxSize int64
 	err     error
 	running bool
 }
 
 // Create a new queued writer
 func New(w io.Writer) *W {
+	return NewSize(w, 0x7fffffffffffffff)
+}
+
+// Craete a new queued writer with a max size
+func NewSize(w io.Writer, maxSize int64) *W {
 	qw := &W{
-		W:   w,
-		out: new(bytes.Buffer),
+		W:       w,
+		out:     new(bytes.Buffer),
+		maxSize: maxSize,
 	}
 	return qw
 }
@@ -59,6 +69,10 @@ func (w *W) Wait() {
 func (w *W) Write(p []byte) (int, error) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
+
+	if int64(w.out.Len())+int64(len(p)) > w.maxSize {
+		w.err = ErrTooLarge
+	}
 
 	if w.err != nil {
 		return 0, w.err
@@ -77,6 +91,10 @@ func (w *W) Write(p []byte) (int, error) {
 func (w *W) WriteString(s string) (int, error) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
+
+	if int64(w.out.Len())+int64(len(s)) > w.maxSize {
+		w.err = ErrTooLarge
+	}
 
 	if w.err != nil {
 		return 0, w.err
@@ -118,6 +136,10 @@ func (w *W) ReadFrom(r io.Reader) (int64, error) {
 				err = nil
 			}
 			return total, err
+		}
+
+		if int64(w.out.Len()) > w.maxSize {
+			w.err = ErrTooLarge
 		}
 
 		// pulse the lock to allow the background proc
