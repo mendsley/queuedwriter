@@ -42,6 +42,7 @@ type W struct {
 	lock    sync.Mutex
 	maxSize int64
 	err     error
+	cb      []func(w io.Writer) error
 	running bool
 }
 
@@ -63,6 +64,26 @@ func NewSize(w io.Writer, maxSize int64) *W {
 // Wait for background process to exit
 func (w *W) Wait() {
 	w.wg.Wait()
+}
+
+// Push a callback function to run an external process
+// on the writer
+func (w *W) PushCallback(fn func(io.Writer) error) error {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	if w.err != nil {
+		return w.err
+	}
+
+	if !w.running {
+		w.wg.Add(1)
+		w.running = true
+		go w.proc()
+	}
+
+	w.cb = append(w.cb, fn)
+	return nil
 }
 
 // Write data to the queue
@@ -152,6 +173,7 @@ func (w *W) ReadFrom(r io.Reader) (int64, error) {
 // background proc to write data to the underlying io.Writer
 func (w *W) proc() {
 	back := new(bytes.Buffer)
+	var callbacks []func(io.Writer) error
 
 	w.lock.Lock()
 	defer func() {
@@ -161,26 +183,36 @@ func (w *W) proc() {
 	}()
 
 	for {
-		if w.out.Len() == 0 {
+		if w.out.Len() == 0 && len(w.cb) == 0 {
 			return
 		}
 
 		// swap buffers; no need to hold lock during I/O
 		back.Reset()
 		w.out, back = back, w.out
+		callbacks, w.cb = w.cb, callbacks[:0]
 
 		var err error
+		// BEGIN --- unlocked for I/O ---
+		w.lock.Unlock()
 		if back.Len() != 0 {
-			// BEGIN --- unlocked for I/O ---
-			w.lock.Unlock()
 			_, err = w.W.Write(back.Bytes())
-			w.lock.Lock()
-			// END   --- unlocked for I/O ---
-
-			if err != nil {
-				w.err = err
-				return
+		}
+		if err == nil {
+			// run callbacks
+			for _, fn := range callbacks {
+				err = fn(w.W)
+				if err != nil {
+					break
+				}
 			}
+		}
+		w.lock.Lock()
+		// END   --- unlocked for I/O ---
+
+		if err != nil {
+			w.err = err
+			return
 		}
 	}
 }
