@@ -38,12 +38,13 @@ var ErrTooLarge = errors.New("queuedWriter.W: too large")
 type W struct {
 	W       io.Writer
 	out     *bytes.Buffer
+	cond    sync.Cond
 	wg      sync.WaitGroup
 	lock    sync.Mutex
+	closed  bool
 	maxSize int64
-	err     error
 	cb      []func(w io.Writer) error
-	running bool
+	err     error
 }
 
 // Create a new queued writer
@@ -58,12 +59,25 @@ func NewSize(w io.Writer, maxSize int64) *W {
 		out:     new(bytes.Buffer),
 		maxSize: maxSize,
 	}
+
+	qw.cond.L = &qw.lock
+
+	qw.wg.Add(1)
+	go qw.proc()
 	return qw
 }
 
 // Wait for background process to exit
 func (w *W) Wait() {
 	w.wg.Wait()
+}
+
+func (w *W) Close() {
+	w.lock.Lock()
+	w.closed = true
+	w.lock.Unlock()
+
+	w.cond.Signal()
 }
 
 // Push a callback function to run an external process
@@ -76,13 +90,8 @@ func (w *W) PushCallback(fn func(io.Writer) error) error {
 		return w.err
 	}
 
-	if !w.running {
-		w.wg.Add(1)
-		w.running = true
-		go w.proc()
-	}
-
 	w.cb = append(w.cb, fn)
+	w.cond.Signal()
 	return nil
 }
 
@@ -99,13 +108,9 @@ func (w *W) Write(p []byte) (int, error) {
 		return 0, w.err
 	}
 
-	if !w.running {
-		w.wg.Add(1)
-		w.running = true
-		go w.proc()
-	}
-
-	return w.out.Write(p)
+	n, err := w.out.Write(p)
+	w.cond.Signal()
+	return n, err
 }
 
 // Write a string to the queue
@@ -121,13 +126,9 @@ func (w *W) WriteString(s string) (int, error) {
 		return 0, w.err
 	}
 
-	if !w.running {
-		w.wg.Add(1)
-		w.running = true
-		go w.proc()
-	}
-
-	return w.out.WriteString(s)
+	n, err := w.out.WriteString(s)
+	w.cond.Signal()
+	return n, err
 }
 
 // Copy an io.Reader to the queue
@@ -142,12 +143,6 @@ func (w *W) ReadFrom(r io.Reader) (int64, error) {
 	for {
 		if w.err != nil {
 			return total, w.err
-		}
-
-		if !w.running {
-			w.wg.Add(1)
-			w.running = true
-			go w.proc()
 		}
 
 		n, err := io.CopyN(w.out, r, 4096)
@@ -165,8 +160,7 @@ func (w *W) ReadFrom(r io.Reader) (int64, error) {
 
 		// pulse the lock to allow the background proc
 		// a chance to flush data
-		w.lock.Unlock()
-		w.lock.Lock()
+		w.cond.Signal()
 	}
 }
 
@@ -177,13 +171,18 @@ func (w *W) proc() {
 
 	w.lock.Lock()
 	defer func() {
-		w.running = false
 		w.lock.Unlock()
 		w.wg.Done()
 	}()
 
 	for {
-		if w.out.Len() == 0 && len(w.cb) == 0 {
+
+		// wait for something to do
+		for !w.closed && w.out.Len() == 0 && len(w.cb) == 0 {
+			w.cond.Wait()
+		}
+
+		if w.closed {
 			return
 		}
 
@@ -193,26 +192,26 @@ func (w *W) proc() {
 		callbacks, w.cb = w.cb, callbacks[:0]
 
 		var err error
-		// BEGIN --- unlocked for I/O ---
-		w.lock.Unlock()
 		if back.Len() != 0 {
+			// BEGIN --- unlocked for I/O ---
+			w.lock.Unlock()
 			_, err = w.W.Write(back.Bytes())
-		}
-		if err == nil {
-			// run callbacks
-			for _, fn := range callbacks {
-				err = fn(w.W)
-				if err != nil {
-					break
+			if err == nil {
+				// run callbacks
+				for _, fn := range callbacks {
+					err = fn(w.W)
+					if err != nil {
+						break
+					}
 				}
 			}
-		}
-		w.lock.Lock()
-		// END   --- unlocked for I/O ---
+			w.lock.Lock()
+			// END   --- unlocked for I/O ---
 
-		if err != nil {
-			w.err = err
-			return
+			if err != nil {
+				w.err = err
+				return
+			}
 		}
 	}
 }
