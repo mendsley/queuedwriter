@@ -35,16 +35,22 @@ import (
 
 var ErrTooLarge = errors.New("queuedWriter.W: too large")
 
+type flusher interface {
+	Flush() error
+}
+
 type W struct {
-	w       io.Writer
-	out     *bytes.Buffer
-	cond    sync.Cond
-	wg      sync.WaitGroup
-	lock    sync.Mutex
-	closed  bool
-	maxSize int64
-	cb      []func(w io.Writer) error
-	err     error
+	w        io.Writer
+	f        flusher
+	out      *bytes.Buffer
+	cond     sync.Cond
+	wg       sync.WaitGroup
+	lock     sync.Mutex
+	closed   bool
+	flushReq bool
+	maxSize  int64
+	cb       []func(w io.Writer) error
+	err      error
 }
 
 // Create a new queued writer
@@ -58,6 +64,10 @@ func NewSize(w io.Writer, maxSize int64) *W {
 		w:       w,
 		out:     new(bytes.Buffer),
 		maxSize: maxSize,
+	}
+
+	if f, ok := w.(flusher); ok {
+		qw.f = f
 	}
 
 	qw.cond.L = &qw.lock
@@ -78,6 +88,24 @@ func (w *W) Close() {
 	w.lock.Unlock()
 
 	w.cond.Signal()
+}
+
+// Flush the underlying stream if supported
+func (w *W) Flush() error {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	if w.err != nil {
+		return w.err
+	}
+
+	// only request the flush if supported
+	if w.f != nil {
+		w.flushReq = true
+		w.cond.Signal()
+	}
+
+	return nil
 }
 
 // Push a callback function to run an external process
@@ -167,7 +195,10 @@ func (w *W) ReadFrom(r io.Reader) (int64, error) {
 // background proc to write data to the underlying io.Writer
 func (w *W) proc() {
 	back := new(bytes.Buffer)
-	var callbacks []func(io.Writer) error
+	var (
+		callbacks []func(io.Writer) error
+		flushReq  bool
+	)
 
 	w.lock.Lock()
 	defer func() {
@@ -178,7 +209,7 @@ func (w *W) proc() {
 	for {
 
 		// wait for something to do
-		for !w.closed && w.out.Len() == 0 && len(w.cb) == 0 {
+		for !w.closed && w.out.Len() == 0 && !w.flushReq && len(w.cb) == 0 {
 			w.cond.Wait()
 		}
 
@@ -190,6 +221,7 @@ func (w *W) proc() {
 		back.Reset()
 		w.out, back = back, w.out
 		callbacks, w.cb = w.cb, callbacks[:0]
+		flushReq, w.flushReq = w.flushReq, false
 
 		// BEGIN --- unlocked for I/O ---
 		w.lock.Unlock()
@@ -205,6 +237,9 @@ func (w *W) proc() {
 					break
 				}
 			}
+		}
+		if err == nil && flushReq {
+			err = w.f.Flush()
 		}
 		w.lock.Lock()
 		// END   --- unlocked for I/O ---
