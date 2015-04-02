@@ -191,27 +191,27 @@ func (w *W) proc() {
 		w.out, back = back, w.out
 		callbacks, w.cb = w.cb, callbacks[:0]
 
+		// BEGIN --- unlocked for I/O ---
+		w.lock.Unlock()
 		var err error
 		if back.Len() != 0 {
-			// BEGIN --- unlocked for I/O ---
-			w.lock.Unlock()
 			_, err = w.w.Write(back.Bytes())
-			if err == nil {
-				// run callbacks
-				for _, fn := range callbacks {
-					err = fn(w.w)
-					if err != nil {
-						break
-					}
+		}
+		if err == nil {
+			// run callbacks
+			for _, fn := range callbacks {
+				err = fn(w.w)
+				if err != nil {
+					break
 				}
 			}
-			w.lock.Lock()
-			// END   --- unlocked for I/O ---
+		}
+		w.lock.Lock()
+		// END   --- unlocked for I/O ---
 
-			if err != nil {
-				w.err = err
-				return
-			}
+		if err != nil {
+			w.err = err
+			return
 		}
 	}
 }
