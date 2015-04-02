@@ -49,7 +49,6 @@ type W struct {
 	closed   bool
 	flushReq bool
 	maxSize  int64
-	cb       []func(w io.Writer) error
 	err      error
 }
 
@@ -105,21 +104,6 @@ func (w *W) Flush() error {
 		w.cond.Signal()
 	}
 
-	return nil
-}
-
-// Push a callback function to run an external process
-// on the writer
-func (w *W) PushCallback(fn func(io.Writer) error) error {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-
-	if w.err != nil {
-		return w.err
-	}
-
-	w.cb = append(w.cb, fn)
-	w.cond.Signal()
 	return nil
 }
 
@@ -195,10 +179,7 @@ func (w *W) ReadFrom(r io.Reader) (int64, error) {
 // background proc to write data to the underlying io.Writer
 func (w *W) proc() {
 	back := new(bytes.Buffer)
-	var (
-		callbacks []func(io.Writer) error
-		flushReq  bool
-	)
+	var flushReq bool
 
 	w.lock.Lock()
 	defer func() {
@@ -209,7 +190,7 @@ func (w *W) proc() {
 	for {
 
 		// wait for something to do
-		for !w.closed && w.out.Len() == 0 && !w.flushReq && len(w.cb) == 0 {
+		for !w.closed && w.out.Len() == 0 && !w.flushReq {
 			w.cond.Wait()
 		}
 
@@ -220,7 +201,6 @@ func (w *W) proc() {
 		// swap buffers; no need to hold lock during I/O
 		back.Reset()
 		w.out, back = back, w.out
-		callbacks, w.cb = w.cb, callbacks[:0]
 		flushReq, w.flushReq = w.flushReq, false
 
 		// BEGIN --- unlocked for I/O ---
@@ -228,15 +208,6 @@ func (w *W) proc() {
 		var err error
 		if back.Len() != 0 {
 			_, err = w.w.Write(back.Bytes())
-		}
-		if err == nil {
-			// run callbacks
-			for _, fn := range callbacks {
-				err = fn(w.w)
-				if err != nil {
-					break
-				}
-			}
 		}
 		if err == nil && flushReq {
 			err = w.f.Flush()
