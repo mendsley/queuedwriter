@@ -36,7 +36,7 @@ import (
 var ErrTooLarge = errors.New("queuedWriter.W: too large")
 
 type W struct {
-	W       io.Writer
+	w       io.Writer
 	out     *bytes.Buffer
 	cond    sync.Cond
 	wg      sync.WaitGroup
@@ -55,7 +55,7 @@ func New(w io.Writer) *W {
 // Craete a new queued writer with a max size
 func NewSize(w io.Writer, maxSize int64) *W {
 	qw := &W{
-		W:       w,
+		w:       w,
 		out:     new(bytes.Buffer),
 		maxSize: maxSize,
 	}
@@ -195,11 +195,11 @@ func (w *W) proc() {
 		if back.Len() != 0 {
 			// BEGIN --- unlocked for I/O ---
 			w.lock.Unlock()
-			_, err = w.W.Write(back.Bytes())
+			_, err = w.w.Write(back.Bytes())
 			if err == nil {
 				// run callbacks
 				for _, fn := range callbacks {
-					err = fn(w.W)
+					err = fn(w.w)
 					if err != nil {
 						break
 					}
